@@ -94,6 +94,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
+| GET  | `/boxes/{box_code}/heat-exposure` | 区间内温度超过上限的精确暴露量积分（摄氏度·秒，保序校正时间，不改原始记录） |
 
 ### 上报事件
 
@@ -241,6 +242,128 @@ curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/clock-audit?seq_from=0&seq_to=1
 curl -i 'http://localhost:8000/boxes/BOX-AUDIT/clock-audit?seq_from=5&seq_to=2'
 ```
 
+## 高温暴露积分（heat-exposure）
+
+`GET /boxes/{box_code}/heat-exposure` 计算指定序号区间内，温度**超过 `upper_limit`**
+部分对时间的精确积分（单位：**摄氏度·秒，°C·s**）。与 clock-audit 一样在查询时
+即时计算，**不改动任何原始记录**；补报后再次查询会基于最新数据重新计算。
+
+计算规则：
+
+1. 按 `seq` 升序取出区间内（含端点）实际存在的事件，**缺号不自动补点**；
+2. 事件时间沿用 clock-audit 的**等权保序回归**（PAVA）校正为非递减序列；
+3. 相邻事件之间温度视为**线性变化**，对超过 `upper_limit` 的部分做精确积分
+   （内部用有理数运算，杜绝浮点误差）——两端都超限时取梯形面积，仅一端超限时
+   按线性过零点切出三角形面积；
+4. 校正后间隔**为零**或**超过 `max_gap_seconds`** 的段不计入积分（明细中
+   `counted=false` 并给出 `excluded_reason`），其余段逐段返回并累加总计。
+
+查询参数（均必填）：
+
+| 参数              | 约束                         | 说明                                   |
+| ----------------- | ---------------------------- | -------------------------------------- |
+| `seq_from`        | 非负整数，`<= seq_to`        | 起始序号（含端点）                     |
+| `seq_to`          | 非负整数                     | 结束序号（含端点）                     |
+| `upper_limit`     | 有限数值                     | 温度上限（°C），仅积分超出部分         |
+| `max_gap_seconds` | **正数**、有限数值           | 相邻事件校正后间隔超过该秒数则不计入   |
+
+返回字段：
+
+| 字段                              | 说明                                                       |
+| --------------------------------- | ---------------------------------------------------------- |
+| `box_code` / `seq_from` / `seq_to` | 回显查询条件                                              |
+| `upper_limit` / `max_gap_seconds` | 回显参数                                                   |
+| `event_count`                     | 区间内实际取到的事件条数（缺号不补）                       |
+| `total_degree_seconds`            | 所有计入段的积分总和（摄氏度·秒）                          |
+| `segments[]`                      | 逐段明细（相邻事件两两成段，见下表）；区间无事件时为 `[]`  |
+
+`segments[]` 每段字段：
+
+| 字段                   | 说明                                                                 |
+| ---------------------- | -------------------------------------------------------------------- |
+| `seq_from` / `seq_to`  | 该段两端事件序号（缺号时二者不相邻）                                 |
+| `corrected_time_from` / `corrected_time_to` | 保序校正后的两端 UTC 时间（不改动原始记录）          |
+| `interval_seconds`     | 校正后的段时长（秒），保序回归保证其非负                             |
+| `temperature_from` / `temperature_to` | 两端温度（°C）                                              |
+| `excess_degree_seconds` | 该段超限部分的积分（未计入段为 0）                                  |
+| `counted`              | 是否计入总计                                                         |
+| `excluded_reason`      | `zero_interval`（校正后间隔为零）/ `gap_too_large`（超过最大间隔）/ `null` |
+
+错误情况：箱号不存在返回 `404`；箱号存在但区间内无事件返回 `200` 零值报告
+（`total_degree_seconds=0`、`segments=[]`）；缺少参数、参数非数值、
+`max_gap_seconds <= 0`、`NaN/Infinity` 或 `seq_from > seq_to` 返回 `422`。
+
+```bash
+# 一组事件（UTC）：seq=0 为 4°C，seq=1 升到 8°C，seq=2 回落到 5°C，每分钟一条
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":0,"temperature":4.0,
+       "event_time":"2026-09-23T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":1,"temperature":8.0,
+       "event_time":"2026-09-23T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":2,"temperature":5.0,
+       "event_time":"2026-09-23T02:02:00+00:00"}'
+
+# 上限 5°C、最大允许间隔 120 秒
+curl 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=2&upper_limit=5&max_gap_seconds=120'
+```
+
+响应（seq 0→1：从 4°C 线性升至 8°C，第 15 秒越过 5°C，随后 45 秒超限高度
+由 0 线性升到 3°C，三角形面积 3×45/2=67.5；seq 1→2：从 8°C 线性回落至 5°C，
+三角形面积 3×60/2=90；总计 157.5 摄氏度·秒）：
+
+```json
+{
+  "box_code": "BOX-HEAT",
+  "seq_from": 0,
+  "seq_to": 2,
+  "upper_limit": 5.0,
+  "max_gap_seconds": 120.0,
+  "event_count": 3,
+  "total_degree_seconds": 157.5,
+  "segments": [
+    {
+      "seq_from": 0,
+      "seq_to": 1,
+      "corrected_time_from": "2026-09-23T02:00:00",
+      "corrected_time_to": "2026-09-23T02:01:00",
+      "interval_seconds": 60.0,
+      "temperature_from": 4.0,
+      "temperature_to": 8.0,
+      "excess_degree_seconds": 67.5,
+      "counted": true,
+      "excluded_reason": null
+    },
+    {
+      "seq_from": 1,
+      "seq_to": 2,
+      "corrected_time_from": "2026-09-23T02:01:00",
+      "corrected_time_to": "2026-09-23T02:02:00",
+      "interval_seconds": 60.0,
+      "temperature_from": 8.0,
+      "temperature_to": 5.0,
+      "excess_degree_seconds": 90.0,
+      "counted": true,
+      "excluded_reason": null
+    }
+  ]
+}
+```
+
+```bash
+# 箱号存在但区间无事件 -> 200 零值报告
+curl 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=100&seq_to=200&upper_limit=5&max_gap_seconds=120'
+# {"box_code":"BOX-HEAT", ..., "event_count":0, "total_degree_seconds":0.0, "segments":[]}
+
+# 间隔超过 max_gap_seconds（或缺号导致的长间隔）-> 该段 counted=false，不计入总计
+# max_gap_seconds 不是正数 -> 422
+curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=2&upper_limit=5&max_gap_seconds=0'
+
+# 箱号不存在 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/heat-exposure?seq_from=0&seq_to=1&upper_limit=5&max_gap_seconds=120'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -255,6 +378,12 @@ curl -i 'http://localhost:8000/boxes/BOX-AUDIT/clock-audit?seq_from=5&seq_to=2'
   再用 PAVA 做等权保序回归：相邻块出现“前块均值 > 后块均值”时向前合并、
   块内取算术均值并四舍五入到微秒，天然得到非递减的建议序列，
   且最小化各事件偏移的平方和。
+- **暴露积分只读且精确**：`heat-exposure` 复用同一套保序校正时间，
+  同样查询时即时计算、不写库、不改动原始事件，补报后重查即重算。
+  相邻事件间温度按线性处理，仅对超过 `upper_limit` 的部分积分；
+  段时长由校正后的整数微秒时间确定，温度与上限以十进制有理数（`Fraction`）
+  参与运算，分段积分结果精确，最后输出时才转为浮点。校正后间隔为零或超过
+  `max_gap_seconds` 的段只在明细中标记、不计入总计；缺号不补点。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。

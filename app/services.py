@@ -1,5 +1,7 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、高温暴露积分。"""
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
+
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -237,17 +239,7 @@ def clock_audit(
         return []
 
     values = [_to_epoch_micros(e.event_time) for e in events]
-    blocks = _isotonic_blocks(values)
-
-    # PAVA 输出的块下标对应 events 下标；展开为逐事件的建议
-    suggested: list[int] = [0] * len(events)
-    block_range: list[tuple[int, int]] = [(0, 0)] * len(events)
-    for idx_from, idx_to, mean_micros in blocks:
-        seq_from_block = events[idx_from].seq
-        seq_to_block = events[idx_to].seq
-        for i in range(idx_from, idx_to + 1):
-            suggested[i] = mean_micros
-            block_range[i] = (seq_from_block, seq_to_block)
+    suggested, block_range = _isotonic_suggest(values, events)
 
     return [
         schemas.ClockAuditItem(
@@ -260,3 +252,178 @@ def clock_audit(
         )
         for i, (event, sugg) in enumerate(zip(events, suggested))
     ]
+
+
+def _isotonic_suggest(
+    values: list[int], events: list[models.BoxEvent]
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """对整数微秒事件时间做等权保序回归，返回 (逐事件建议微秒, 逐事件块序号范围)。
+
+    clock-audit 与 heat-exposure 共用同一套校正逻辑：PAVA 合并违规块、
+    块内取算术均值并四舍五入到微秒，建议序列保证非递减。
+    """
+    blocks = _isotonic_blocks(values)
+    suggested: list[int] = [0] * len(events)
+    block_range: list[tuple[int, int]] = [(0, 0)] * len(events)
+    for idx_from, idx_to, mean_micros in blocks:
+        seq_from_block = events[idx_from].seq
+        seq_to_block = events[idx_to].seq
+        for i in range(idx_from, idx_to + 1):
+            suggested[i] = mean_micros
+            block_range[i] = (seq_from_block, seq_to_block)
+    return suggested, block_range
+
+
+def _range_events(
+    db: Session, box_code: str, seq_from: int, seq_to: int
+) -> tuple[bool, list[models.BoxEvent]]:
+    """取某箱号序号区间（含端点）内按 seq 升序的事件。
+
+    返回 (箱号是否存在, 事件列表)。箱号存在但区间无事件时返回 (True, [])。
+    """
+    box_exists = db.scalar(
+        select(func.count())
+        .select_from(models.BoxEvent)
+        .where(models.BoxEvent.box_code == box_code)
+    )
+    if not box_exists:
+        return False, []
+    events = list(
+        db.scalars(
+            select(models.BoxEvent)
+            .where(
+                models.BoxEvent.box_code == box_code,
+                models.BoxEvent.seq >= seq_from,
+                models.BoxEvent.seq <= seq_to,
+            )
+            .order_by(models.BoxEvent.seq)
+        ).all()
+    )
+    return True, events
+
+
+def _linear_excess_degree_seconds(
+    temp_from: Fraction,
+    temp_to: Fraction,
+    upper_limit: Fraction,
+    gap_micros: int,
+) -> Fraction:
+    """相邻事件间温度视为线性变化时，超过上限部分的精确积分（摄氏度·秒）。
+
+    用有理数精确计算，避免浮点误差：
+    - 两端都不超限：0
+    - 两端都超限：梯形面积 ((t0-L)+(t1-L))/2 * 时长
+    - 恰好一端超限：超限侧的三角形面积，线性过上限点按比例切出时长
+    """
+    if temp_from <= upper_limit and temp_to <= upper_limit:
+        return Fraction(0)
+    if temp_from > upper_limit and temp_to > upper_limit:
+        excess = (temp_from - upper_limit) + (temp_to - upper_limit)
+        return excess * gap_micros / 2 / 1_000_000
+    if temp_from > upper_limit:
+        return (
+            (temp_from - upper_limit)
+            * (temp_from - upper_limit)
+            * gap_micros
+            / (temp_from - temp_to)
+            / 2
+            / 1_000_000
+        )
+    # 仅终点超限
+    return (
+        (temp_to - upper_limit)
+        * (temp_to - upper_limit)
+        * gap_micros
+        / (temp_to - temp_from)
+        / 2
+        / 1_000_000
+    )
+
+
+def heat_exposure(
+    db: Session,
+    box_code: str,
+    seq_from: int,
+    seq_to: int,
+    upper_limit: float,
+    max_gap_seconds: float,
+) -> schemas.HeatExposureReport | None:
+    """计算序号区间内温度超过 upper_limit 的精确暴露量（摄氏度·秒）。
+
+    - 箱号不存在（从未上报过）：返回 None，由路由层转 404
+    - 箱号存在但区间内无事件：返回总计为 0、segments 为空的零值报告
+    - 校正时间与积分均在查询时即时计算，不改动任何原始记录；补报后重查即重算
+    - 校正后间隔为零或超过 max_gap_seconds 的相邻事件段不计入积分；
+      缺号不补点，仅按区间内实际事件两两成段
+    """
+    box_exists, events = _range_events(db, box_code, seq_from, seq_to)
+    if not box_exists:
+        return None
+
+    # 上限/最大间隔用十进制字符串构造有理数，忠实于请求中的数值表示
+    limit = Fraction(str(upper_limit))
+    max_gap = Fraction(str(max_gap_seconds))
+
+    report = schemas.HeatExposureReport(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        upper_limit=upper_limit,
+        max_gap_seconds=max_gap_seconds,
+        event_count=len(events),
+        total_degree_seconds=0.0,
+        segments=[],
+    )
+    if len(events) < 2:
+        # 无事件或仅单条事件：没有可积分的时间段
+        return report
+
+    values = [_to_epoch_micros(e.event_time) for e in events]
+    suggested, _ = _isotonic_suggest(values, events)
+
+    total = Fraction(0)
+    segments: list[schemas.HeatExposureSegment] = []
+    for i in range(len(events) - 1):
+        left, right = events[i], events[i + 1]
+        gap_micros = suggested[i + 1] - suggested[i]  # 保序回归保证非负
+        gap_seconds = gap_micros / 1_000_000
+
+        counted = True
+        excluded_reason: str | None = None
+        if gap_micros == 0:
+            counted = False
+            excluded_reason = "zero_interval"
+        elif gap_seconds > max_gap:
+            counted = False
+            excluded_reason = "gap_too_large"
+
+        if counted:
+            excess = _linear_excess_degree_seconds(
+                Fraction(str(left.temperature)),
+                Fraction(str(right.temperature)),
+                limit,
+                gap_micros,
+            )
+            total += excess
+            excess_value = float(excess)
+        else:
+            excess_value = 0.0
+
+        segments.append(
+            schemas.HeatExposureSegment(
+                seq_from=left.seq,
+                seq_to=right.seq,
+                corrected_time_from=_from_epoch_micros(suggested[i]),
+                corrected_time_to=_from_epoch_micros(suggested[i + 1]),
+                interval_seconds=float(gap_seconds),
+                temperature_from=left.temperature,
+                temperature_to=right.temperature,
+                excess_degree_seconds=excess_value,
+                counted=counted,
+                excluded_reason=excluded_reason,
+            )
+        )
+
+    report.segments = segments
+    report.total_degree_seconds = float(total)
+    return report

@@ -62,3 +62,39 @@ class ClockAuditItem(BaseModel):
     )
     block_seq_from: int = Field(..., description="该事件所属合并块的起始序号")
     block_seq_to: int = Field(..., description="该事件所属合并块的结束序号")
+
+
+class HeatExposureSegment(BaseModel):
+    seq_from: int = Field(..., description="该段起点事件序号")
+    seq_to: int = Field(..., description="该段终点事件序号（缺号不补点，二者不一定相邻）")
+    corrected_time_from: datetime = Field(..., description="起点事件经等权保序校正后的 UTC 时间")
+    corrected_time_to: datetime = Field(..., description="终点事件经等权保序校正后的 UTC 时间")
+    interval_seconds: float = Field(
+        ..., description="校正后相邻事件的时间间隔（秒），保序回归保证其非负"
+    )
+    temperature_from: float = Field(..., description="起点事件温度（°C）")
+    temperature_to: float = Field(..., description="终点事件温度（°C）")
+    excess_degree_seconds: float = Field(
+        ..., description="该段温度线性变化时超过 upper_limit 部分的精确积分（摄氏度·秒）；未计入段为 0"
+    )
+    counted: bool = Field(
+        ..., description="是否计入总计：校正后间隔为零或超过 max_gap_seconds 时为 false"
+    )
+    excluded_reason: str | None = Field(
+        None, description="未计入原因：zero_interval（校正后间隔为零）/ gap_too_large（超过 max_gap_seconds）"
+    )
+
+
+class HeatExposureReport(BaseModel):
+    box_code: str
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    upper_limit: float = Field(..., description="温度上限（°C），仅积分超出该值的部分")
+    max_gap_seconds: float = Field(..., description="允许计入积分的最大相邻事件间隔（秒）")
+    event_count: int = Field(..., description="区间内实际取到的事件条数（不补缺号）")
+    total_degree_seconds: float = Field(
+        ..., description="所有计入段 excess_degree_seconds 之和（摄氏度·秒）"
+    )
+    segments: list[HeatExposureSegment] = Field(
+        ..., description="逐段积分明细（按序号升序的相邻事件两两成段）"
+    )
