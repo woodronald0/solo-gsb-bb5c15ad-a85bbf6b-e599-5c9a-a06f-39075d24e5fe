@@ -62,3 +62,29 @@ class ClockAuditItem(BaseModel):
     )
     block_seq_from: int = Field(..., description="该事件所属合并块的起始序号")
     block_seq_to: int = Field(..., description="该事件所属合并块的结束序号")
+
+
+class HeatExposureSegment(BaseModel):
+    start_seq: int = Field(..., description="段起点事件序号")
+    end_seq: int = Field(..., description="段终点事件序号")
+    start_time: datetime = Field(..., description="段起点校正后 UTC 时间（等权保序回归）")
+    end_time: datetime = Field(..., description="段终点校正后 UTC 时间（等权保序回归）")
+    gap_seconds: float = Field(..., description="校正后段时长（秒）")
+    start_temperature: float = Field(..., description="段起点温度（℃）")
+    end_temperature: float = Field(..., description="段终点温度（℃）")
+    celsius_seconds: float = Field(..., description="该段超过上限部分的精确积分（℃·秒）")
+
+
+class HeatExposureResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    upper_limit: float = Field(..., description="温度上限（℃）")
+    max_gap_seconds: float = Field(..., description="允许计入的最大段时长（秒）")
+    event_count: int = Field(..., description="区间内事件条数")
+    segment_count: int = Field(..., description="计入积分的段数")
+    skipped_segment_count: int = Field(
+        ..., description="因校正后间隔为零或超过 max_gap_seconds 而未计入的段数"
+    )
+    total_celsius_seconds: float = Field(..., description="各段积分合计（℃·秒）")
+    segments: list[HeatExposureSegment] = Field(..., description="计入积分的逐段明细")

@@ -139,3 +139,44 @@ def get_box_clock_audit(
     if items is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
     return items
+
+
+@app.get(
+    "/boxes/{box_code}/heat-exposure",
+    tags=["boxes"],
+    response_model=schemas.HeatExposureResult,
+    summary="区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录）",
+)
+def get_box_heat_exposure(
+    box_code: str,
+    db: DbSession,
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+    upper_limit: Annotated[
+        float, Query(allow_inf_nan=False, description="温度上限（℃），超过部分计入积分")
+    ],
+    max_gap_seconds: Annotated[
+        float,
+        Query(
+            gt=0,
+            allow_inf_nan=False,
+            description="允许计入的最大相邻校正间隔（秒，正数）；间隔为零或超过它的段不计入",
+        ),
+    ],
+) -> schemas.HeatExposureResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    result = services.heat_exposure(
+        db, box_code.strip(), seq_from, seq_to, upper_limit, max_gap_seconds
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
+    return result

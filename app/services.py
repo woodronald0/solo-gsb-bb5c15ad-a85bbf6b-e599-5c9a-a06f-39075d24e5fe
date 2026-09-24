@@ -1,4 +1,5 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分。"""
+import math
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -204,15 +205,13 @@ def _isotonic_blocks(values: list[int]) -> list[tuple[int, int, int]]:
     ]
 
 
-def clock_audit(
+def _events_in_range(
     db: Session, box_code: str, seq_from: int, seq_to: int
-) -> list[schemas.ClockAuditItem] | None:
-    """对指定序号区间（含端点）生成设备时钟回拨校正建议。
+) -> list[models.BoxEvent] | None:
+    """按 seq 升序取区间内事件（含端点）。
 
-    - 箱号不存在（从未上报过）：返回 None，由路由层转 404
-    - 箱号存在但区间内无事件：返回 []
-    - 校正只在本次查询中即时计算，不改动任何原始记录；乱序补报后再次查询
-      会基于最新数据重新计算
+    箱号不存在（从未上报过）返回 None，由调用方转 404；
+    箱号存在但区间内无事件返回 []。缺号不补点，只返回库中实际事件。
     """
     box_exists = db.scalar(
         select(func.count())
@@ -222,7 +221,7 @@ def clock_audit(
     if not box_exists:
         return None
 
-    events = list(
+    return list(
         db.scalars(
             select(models.BoxEvent)
             .where(
@@ -233,9 +232,16 @@ def clock_audit(
             .order_by(models.BoxEvent.seq)
         ).all()
     )
-    if not events:
-        return []
 
+
+def _isotonic_suggestions(
+    events: list[models.BoxEvent],
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """对按 seq 升序的事件做等权保序回归校正（clock-audit 同款算法）。
+
+    返回 (逐事件建议时间的整数微秒, 逐事件所属合并块的 (起始序号, 结束序号))，
+    下标与 events 一一对应。只读计算，不改动任何原始记录。
+    """
     values = [_to_epoch_micros(e.event_time) for e in events]
     blocks = _isotonic_blocks(values)
 
@@ -248,6 +254,27 @@ def clock_audit(
         for i in range(idx_from, idx_to + 1):
             suggested[i] = mean_micros
             block_range[i] = (seq_from_block, seq_to_block)
+    return suggested, block_range
+
+
+def clock_audit(
+    db: Session, box_code: str, seq_from: int, seq_to: int
+) -> list[schemas.ClockAuditItem] | None:
+    """对指定序号区间（含端点）生成设备时钟回拨校正建议。
+
+    - 箱号不存在（从未上报过）：返回 None，由路由层转 404
+    - 箱号存在但区间内无事件：返回 []
+    - 校正只在本次查询中即时计算，不改动任何原始记录；乱序补报后再次查询
+      会基于最新数据重新计算
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+    if not events:
+        return []
+
+    values = [_to_epoch_micros(e.event_time) for e in events]
+    suggested, block_range = _isotonic_suggestions(events)
 
     return [
         schemas.ClockAuditItem(
@@ -260,3 +287,89 @@ def clock_audit(
         )
         for i, (event, sugg) in enumerate(zip(events, suggested))
     ]
+
+
+def _segment_exposure(
+    temp_from: float, temp_to: float, upper_limit: float, gap_seconds: float
+) -> float:
+    """相邻两点间温度线性变化时，超过 upper_limit 部分对时间的精确积分（℃·秒）。
+
+    超出量 a = temp_from - upper_limit、b = temp_to - upper_limit 同样线性变化，
+    在时长 gap_seconds（> 0）上对 max(超出量, 0) 积分：
+    - 两端都不超：0
+    - 两端都超：梯形面积 (a + b) / 2 * d
+    - 一端超：线性过限，超出部分是三角形，面积 超端超出量² / (2 * |b - a|) * d
+    """
+    a = temp_from - upper_limit
+    b = temp_to - upper_limit
+    if a <= 0.0 and b <= 0.0:
+        return 0.0
+    if a >= 0.0 and b >= 0.0:
+        return (a + b) / 2.0 * gap_seconds
+    over = max(a, b)
+    return over * over / (2.0 * abs(b - a)) * gap_seconds
+
+
+def heat_exposure(
+    db: Session,
+    box_code: str,
+    seq_from: int,
+    seq_to: int,
+    upper_limit: float,
+    max_gap_seconds: float,
+) -> schemas.HeatExposureResult | None:
+    """区间内相邻事件的超温积分（℃·秒），基于 clock-audit 同款校正时间。
+
+    - 相邻事件（按 seq 升序，缺号不补点）间温度视为线性变化，对超过
+      upper_limit 的部分做精确积分
+    - 事件时间先按等权保序回归校正；校正后间隔为零或超过 max_gap_seconds
+      的段不计入积分（也不出现在明细中）
+    - 只在查询时即时计算，不改动任何原始记录；补报后重查即重算
+    - 箱号不存在返回 None，由路由层转 404；区间无事件返回零值及空明细
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+
+    corrected, _ = _isotonic_suggestions(events)
+
+    segments: list[schemas.HeatExposureSegment] = []
+    exposures: list[float] = []
+    skipped = 0
+    for i in range(len(events) - 1):
+        gap_micros = corrected[i + 1] - corrected[i]
+        gap_seconds = gap_micros / 1_000_000
+        # 校正时间非递减，间隔只会 >= 0；为 0（同块）或超上限的段不计入
+        if gap_micros <= 0 or gap_seconds > max_gap_seconds:
+            skipped += 1
+            continue
+        exposure = _segment_exposure(
+            events[i].temperature, events[i + 1].temperature,
+            upper_limit, gap_seconds,
+        )
+        exposures.append(exposure)
+        segments.append(
+            schemas.HeatExposureSegment(
+                start_seq=events[i].seq,
+                end_seq=events[i + 1].seq,
+                start_time=_from_epoch_micros(corrected[i]),
+                end_time=_from_epoch_micros(corrected[i + 1]),
+                gap_seconds=gap_seconds,
+                start_temperature=events[i].temperature,
+                end_temperature=events[i + 1].temperature,
+                celsius_seconds=exposure,
+            )
+        )
+
+    return schemas.HeatExposureResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        upper_limit=upper_limit,
+        max_gap_seconds=max_gap_seconds,
+        event_count=len(events),
+        segment_count=len(segments),
+        skipped_segment_count=skipped,
+        total_celsius_seconds=math.fsum(exposures),
+        segments=segments,
+    )

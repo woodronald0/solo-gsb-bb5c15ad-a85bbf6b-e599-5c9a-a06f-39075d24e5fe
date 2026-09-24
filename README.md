@@ -19,7 +19,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -94,6 +94,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
+| GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
 
 ### 上报事件
 
@@ -241,6 +242,119 @@ curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/clock-audit?seq_from=0&seq_to=1
 curl -i 'http://localhost:8000/boxes/BOX-AUDIT/clock-audit?seq_from=5&seq_to=2'
 ```
 
+## 超温积分（heat-exposure）
+
+`GET /boxes/{box_code}/heat-exposure`（默认访问端口 **8000**）计算指定序号区间内
+温度超过上限的**累计暴露量**，单位为 **℃·秒**：
+
+- 按 `seq` 升序取区间内事件，事件时间沿用 clock-audit 的**等权保序回归校正**
+  （只读即时计算，不改原始记录；乱序补报后重查即自动重算）。
+- 相邻两条事件之间温度视为**线性变化**，对超过 `upper_limit` 的部分做**精确积分**
+  （两端都超为梯形、一端超出为三角形、都不超为 0）。
+- **缺号不自动补点**：相邻指区间内实际存在的相邻两条事件，序号可以跳号。
+- 校正后间隔**为零**（同一合并块）或**超过 `max_gap_seconds`** 的段**不计入积分**，
+  也不出现在明细中（以 `skipped_segment_count` 计数）。
+- 箱号不存在返回 `404`；区间内无事件返回零值与空明细；参数非法返回 `422`。
+
+查询参数：
+
+- `seq_from` / `seq_to`：序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to`。
+- `upper_limit`：温度上限（℃），超过部分计入积分，须为有限数值。
+- `max_gap_seconds`：允许计入的最大相邻校正间隔（秒），**必须为正数**（有限数值）。
+
+返回字段：
+
+| 字段                     | 说明                                                       |
+| ------------------------ | ---------------------------------------------------------- |
+| `event_count`            | 区间内事件条数                                             |
+| `segment_count`          | 计入积分的段数（即 `segments` 长度）                       |
+| `skipped_segment_count`  | 因校正后间隔为零或超过 `max_gap_seconds` 而未计入的段数    |
+| `total_celsius_seconds`  | 各段积分合计（℃·秒）                                       |
+| `segments[]`             | 计入积分的逐段明细                                         |
+
+`segments[]` 中每段包含：`start_seq` / `end_seq`（端点事件序号）、
+`start_time` / `end_time`（**校正后**的 UTC 时间）、`gap_seconds`（校正后段时长）、
+`start_temperature` / `end_temperature`、`celsius_seconds`（该段积分）。
+
+```bash
+# 先上报一组事件（UTC）：-5℃ -> 1℃ -> 3℃ -> -1℃，每分钟一条
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":0,"temperature":-5.0,
+       "event_time":"2026-09-23T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":1,"temperature":1.0,
+       "event_time":"2026-09-23T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":2,"temperature":3.0,
+       "event_time":"2026-09-23T02:02:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-HEAT","seq":3,"temperature":-1.0,
+       "event_time":"2026-09-23T02:03:00+00:00"}'
+
+# 查询 0..3 区间、上限 -2℃、最大间隔 120 秒的超温积分
+curl 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&upper_limit=-2&max_gap_seconds=120'
+```
+
+响应（段 0→1 线性穿越上限，超出部分为三角形 45；段 1→2、2→3 全程超限，梯形 240、180）：
+
+```json
+{
+  "box_code": "BOX-HEAT",
+  "seq_from": 0,
+  "seq_to": 3,
+  "upper_limit": -2.0,
+  "max_gap_seconds": 120.0,
+  "event_count": 4,
+  "segment_count": 3,
+  "skipped_segment_count": 0,
+  "total_celsius_seconds": 465.0,
+  "segments": [
+    {
+      "start_seq": 0,
+      "end_seq": 1,
+      "start_time": "2026-09-23T02:00:00",
+      "end_time": "2026-09-23T02:01:00",
+      "gap_seconds": 60.0,
+      "start_temperature": -5.0,
+      "end_temperature": 1.0,
+      "celsius_seconds": 45.0
+    },
+    {
+      "start_seq": 1,
+      "end_seq": 2,
+      "start_time": "2026-09-23T02:01:00",
+      "end_time": "2026-09-23T02:02:00",
+      "gap_seconds": 60.0,
+      "start_temperature": 1.0,
+      "end_temperature": 3.0,
+      "celsius_seconds": 240.0
+    },
+    {
+      "start_seq": 2,
+      "end_seq": 3,
+      "start_time": "2026-09-23T02:02:00",
+      "end_time": "2026-09-23T02:03:00",
+      "gap_seconds": 60.0,
+      "start_temperature": 3.0,
+      "end_temperature": -1.0,
+      "celsius_seconds": 180.0
+    }
+  ]
+}
+```
+
+```bash
+# 箱号存在但区间内无事件 -> 200，零值 + 空明细
+curl 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=100&seq_to=200&upper_limit=-2&max_gap_seconds=120'
+
+# 箱号不存在 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/heat-exposure?seq_from=0&seq_to=1&upper_limit=-2&max_gap_seconds=120'
+
+# 参数非法（seq_from > seq_to、max_gap_seconds <= 0 等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=5&seq_to=2&upper_limit=-2&max_gap_seconds=120'
+curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&upper_limit=-2&max_gap_seconds=0'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -255,6 +369,10 @@ curl -i 'http://localhost:8000/boxes/BOX-AUDIT/clock-audit?seq_from=5&seq_to=2'
   再用 PAVA 做等权保序回归：相邻块出现“前块均值 > 后块均值”时向前合并、
   块内取算术均值并四舍五入到微秒，天然得到非递减的建议序列，
   且最小化各事件偏移的平方和。
+- **超温积分只读**：`heat-exposure` 复用同一套保序回归校正时间，把相邻事件间的
+  温度视为线性变化，对超过 `upper_limit` 的部分解析求积（梯形/三角形公式），
+  逐段积分用 `math.fsum` 精确求和；校正后间隔为零或超过 `max_gap_seconds` 的段
+  直接跳过，缺号不补点。同样不写库，补报后重查即重算。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。
